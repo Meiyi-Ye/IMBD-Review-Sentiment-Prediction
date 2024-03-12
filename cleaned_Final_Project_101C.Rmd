@@ -1,0 +1,496 @@
+---
+title: "STATS 101C Final Project"
+author: "Meiyi Ye"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r, include=FALSE, warning=FALSE}
+library(tidytext)
+library(textdata)
+library(tm)
+library(purrr)
+library(stringr)
+library(class)
+library(MASS)
+library(randomForest)
+library(glmnet)
+library(caret)
+library(randomForest)
+```
+
+# Conducting the Sentiment Analysis
+
+## Loading the Cleaned Data
+
+```{r, include=FALSE}
+reviews <- read.csv("all_clean_reviews.csv")[, -(1:2)]
+head(reviews)
+```
+
+## Conducting Sentiment Mapping
+
+```{r, include=FALSE}
+# Create binary result: 1 = positive review, 0 = negative review
+movie_binary <- as.integer(reviews$sentiment == "positive")
+
+# Load the bing lexicon
+bing_lexicon <- get_sentiments("bing")
+
+# Clean the bing lexicon
+bing_lexicon$word <- gsub("\\*\\*", "", bing_lexicon$word)
+
+# Create a key for sentiment mapping
+key <- setNames(bing_lexicon$sentiment, paste0("\\b", bing_lexicon$word, "\\b"))
+
+# Replace words with sentiment using the function
+clean_review <- str_replace_all(reviews$clean_review, key)
+
+# Function to check if each word is equal to the target word
+binary_sentence <- function(sentence, target_word = "positive") as.integer(strsplit(sentence, " ")[[1]] == target_word)
+
+# Apply the function to each sentence in the vector
+pos_review <- lapply(clean_review, binary_sentence, target_word = "positive")
+neg_review <- lapply(clean_review, binary_sentence, target_word = "negative")
+
+# Calculate positive term frequency within a review
+pos_freq <- sapply(pos_review, sum) / lengths(pos_review)
+neg_freq <- sapply(neg_review, sum) / lengths(neg_review)
+
+# Combine positive and negative term frequencies into a data frame
+term_freq_df <- data.frame(
+  term_freq_positive = pos_freq,
+  term_freq_negative = neg_freq,
+  response = movie_binary
+)
+
+# Scale the positive and negative term frequencies
+term_freq_df_scaled <- data.frame(
+  term_freq_positive = scale(term_freq_df$term_freq_positive),
+  term_freq_negative = scale(term_freq_df$term_freq_negative),
+  response = term_freq_df$response
+)
+
+# Set seed for reproducibility
+set.seed(1)
+
+# Sample indices for training data
+i <- sample(1:50000, 25000)
+
+# The training and testing data for analysis
+training <- term_freq_df_scaled[i, ]
+testing <- term_freq_df_scaled[-i, ]
+
+# How I saved the data 
+# write.csv(training, "updatedTraining.csv")
+# write.csv(testing, "updatedTesting.csv")
+```
+
+
+# Building A Model 
+
+### Loading the Testing and Training Data
+
+```{r, include=FALSE}
+# [-1, ] to remove 'X' (index) column
+testing <- read.csv("final_testing.csv")[, -1]
+training <- read.csv("final_training.csv")[, -1]
+
+head(testing)
+head(training)
+```
+
+
+## Conducting Logistic Regression
+
+```{r}
+# Logistic Regression Model with positive and negative term frequencies
+log_model <- glm(response ~ term_freq_positive + term_freq_negative, 
+                 data = training, family = "binomial")
+summary(log_model)
+
+# Prediction on Testing Data
+predictions <- predict(log_model, newdata = testing, type = "response")
+pos_predict <- as.numeric(predictions > 0.5)
+
+# Confusion Matrix
+conf_table <- table("Reference" = testing$response, "Predicted" = pos_predict)
+print(conf_table)
+
+# Accuracy Calculation
+accuracy <- sum(diag(conf_table)) / sum(conf_table)
+print(accuracy)
+# 0.73488
+```
+
+### Logistic Regression With L2 Regularization
+
+```{r}
+# Combine positive and negative term frequencies into a matrix
+X <- cbind(training$term_freq_positive, training$term_freq_negative)
+
+# Create a binary response variable
+y <- as.numeric(training$response)
+
+# Create a sequence of lambda values
+lambda_seq <- 10^seq(10, -2, length = 100)
+
+# Fit logistic regression model with L2 regularization using cross-validation
+glm_model <- cv.glmnet(X, y, family = "binomial", alpha = 0, lambda = lambda_seq)
+
+# Plot the cross-validated mean deviance against log(lambda)
+# plot(glm_model)
+
+# Identify the optimal lambda that minimizes the mean deviance
+best_lambda <- glm_model$lambda.min
+cat("Best Lambda:", best_lambda, "\n")
+
+# Prediction on Testing Data
+X_test <- cbind(testing$term_freq_positive, testing$term_freq_negative)
+predictions <- predict(glm_model, newx = X_test, s = best_lambda, type = "response")
+pos_predict <- as.numeric(predictions > 0.5)
+
+# Confusion Matrix
+conf_table <- table("Reference" = testing$response, "Predicted" = pos_predict)
+print(conf_table)
+
+# Accuracy Calculation
+accuracy <- sum(diag(conf_table)) / sum(conf_table)
+print(accuracy)
+# 0.73504
+```
+
+
+## Creating a KNN Classifier
+
+### Setting k = 3
+
+```{r}
+# Combine positive and negative term frequencies into a matrix
+term_freq_matrix <- cbind(training$term_freq_positive, training$term_freq_negative)#, training$word_count)
+term_freq_test_matrix <- cbind(testing$term_freq_positive, testing$term_freq_negative)#, testing$word_count)
+
+# KNN Classifier with positive and negative term frequencies
+knn_classifier <- knn(train = term_freq_matrix, test = term_freq_test_matrix, cl = training$response, k = 3)
+
+# Confusion Matrix
+conf_table <- table("Reference" = testing$response, "Predicted" = knn_classifier)
+print(conf_table)
+
+# Accuracy Calculation
+accuracy <- sum(diag(conf_table)) / sum(conf_table)
+print(accuracy)
+# 0.68752
+```
+
+### Attempting KNN With Cross Validation to Select Optimal 'k'
+
+```{r}
+# Combine positive and negative term frequencies into a matrix
+term_freq_matrix <- cbind(training$term_freq_positive, training$term_freq_negative)
+
+# Create a binary response variable
+y <- as.factor(training$response)
+
+# Combine features and response into a data frame
+train_data <- data.frame(
+  term_freq_positive = training$term_freq_positive,
+  term_freq_negative = training$term_freq_negative,
+  response = y
+)
+
+# Create a training control with repeated cross-validation
+ctrl <- trainControl(method = "cv", number = 10, repeats = 3)
+
+# Train the KNN model using cross-validation
+knn_model <- train(response ~ term_freq_positive + term_freq_negative, 
+                   data = train_data, method = "knn", 
+                   trControl = ctrl, tuneGrid = expand.grid(k = 1:20))
+
+# Print the results
+print(knn_model)
+
+# Plot the cross-validated errors
+plot(knn_model)
+
+# Get the best k value
+best_k <- knn_model$bestTune$k
+cat("Best k value:", best_k, "\n")
+
+# Predict using the best k value on the testing data
+term_freq_test_matrix <- cbind(testing$term_freq_positive, testing$term_freq_negative)
+knn_predictions <- predict(knn_model, 
+                           newdata = data.frame(term_freq_positive = term_freq_test_matrix[, 1], 
+                                                term_freq_negative = term_freq_test_matrix[, 2]))
+
+# Confusion Matrix
+conf_table <- table("Reference" = testing$response, "Predicted" = knn_predictions)
+print(conf_table)
+
+# Accuracy Calculation
+accuracy <- sum(diag(conf_table)) / sum(conf_table)
+print(accuracy)
+# 0.72412
+```
+
+**Column 1 (k):**
+The number of neighbors considered in the KNN model.
+
+**Column 2 (Accuracy):**
+The average accuracy across the cross-validation folds for the corresponding k 
+value.
+
+**Column 3 (Kappa):** 
+A performance metric that measures the agreement between the predicted and 
+actual classes, adjusted for the possibility of chance agreement. It provides a 
+measure of model performance that accounts for the class distribution.
+
+
+^^**DO WE WANT TO EXPLICITLY SELECT A K AND MAKE A FINAL KNN MODEL?**
+
+
+## Conducting LDA
+
+```{r}
+# LDA Model with positive and negative term frequencies
+lda_model <- lda(response ~ term_freq_positive + term_freq_negative, data = training)
+
+# Make predictions on testing data
+predictions <- predict(lda_model, testing)$class
+
+# Confusion Matrix
+conf_table <- table("Reference" = testing$response, "Predicted" = predictions)
+print(conf_table)
+
+# Accuracy Calculation
+accuracy <- sum(diag(conf_table)) / sum(conf_table)
+print(accuracy)
+# 0.73368
+```
+
+### Conducting LDA With Leave-One-Out Cross Validation (LOOCV)
+
+```{r}
+# Specify the formula for the LDA model
+formula <- response ~ term_freq_positive + term_freq_negative
+
+# Combine features and response into a data frame
+data <- data.frame(
+  term_freq_positive = c(training$term_freq_positive, testing$term_freq_positive),
+  term_freq_negative = c(training$term_freq_negative, testing$term_freq_negative),
+  response = factor(c(training$response, testing$response))
+)
+
+# Set the number of folds
+K <- 10
+
+# Create an empty vector to store accuracy values
+accuracy_values <- numeric(K)
+confusion_matrices <- list()
+
+# Perform cross-validation
+set.seed(1)  # Set seed for reproducibility
+for (i in 1:K) {
+  # Split the data into training and testing sets
+  test_indices <- ((i - 1) * nrow(data) / K + 1):(i * nrow(data) / K)
+  test_data <- data[test_indices, ]
+  train_data <- data[-test_indices, ]
+
+  # Fit the LDA model on the training data
+  lda_model <- lda(formula, data = train_data)
+
+  # Make predictions on the test data
+  predictions <- predict(lda_model, newdata = test_data)
+
+  # Calculate accuracy and store in the vector
+  accuracy_values[i] <- sum(predictions$class == test_data$response) / nrow(test_data)
+  
+  confusion_matrices[[i]] <- table("Reference" = test_data$response, "Predicted" = predictions$class)
+}
+
+# Print mean cross-validated accuracy
+mean_accuracy <- mean(accuracy_values)
+print(mean_accuracy)
+# 0.73522
+
+for (i in 1:K) {
+  cat("\n")
+  print(paste("Confusion Matrix - Iteration", i))
+  print(confusion_matrices[[i]])
+  print(paste("Accuracy: ", accuracy_values[i]))
+}
+
+# Finding max accuracy: 0.7448
+max(accuracy_values)
+
+# Finding avg accuracy: 0.73522
+mean(accuracy_values)
+```
+
+
+## Conducting QDA
+
+```{r}
+# QDA Model with positive and negative term frequencies
+qda_model <- qda(response ~ term_freq_positive + term_freq_negative, data = training)
+
+# Make predictions
+predictions <- predict(qda_model, testing)$class
+
+# Confusion Matrix
+conf_table <- table("Reference" = testing$response, "Predicted" = predictions)
+print(conf_table)
+
+# Accuracy Calculation
+accuracy <- sum(diag(conf_table)) / sum(conf_table)
+print(accuracy)
+# 0.73212
+```
+
+### Conducting QDA With Cross Validation
+
+```{r}
+# Specify the formula for the QDA model
+formula <- response ~ term_freq_positive + term_freq_negative
+
+# Combine features and response into a data frame
+data <- data.frame(
+  term_freq_positive = c(training$term_freq_positive, testing$term_freq_positive),
+  term_freq_negative = c(training$term_freq_negative, testing$term_freq_negative),
+  response = factor(c(training$response, testing$response))
+)
+
+# Set the number of folds
+K <- 10
+
+# Create an empty vector to store accuracy values
+accuracy_values <- numeric(K)
+
+# Perform cross-validation
+set.seed(1)  # Set seed for reproducibility
+for (i in 1:K) {
+  # Split the data into training and testing sets
+  test_indices <- ((i - 1) * nrow(data) / K + 1):(i * nrow(data) / K)
+  test_data <- data[test_indices, ]
+  train_data <- data[-test_indices, ]
+
+  # Fit the QDA model on the training data
+  qda_model <- qda(formula, data = train_data)
+
+  # Make predictions on the test data
+  predictions <- predict(qda_model, newdata = test_data)
+
+  # Calculate accuracy and store in the vector
+  accuracy_values[i] <- sum(predictions$class == test_data$response) / nrow(test_data)
+}
+
+# Print mean cross-validated accuracy
+mean_accuracy <- mean(accuracy_values)
+print(mean_accuracy)
+# 0.7333
+```
+
+
+## Conducting Random Forest
+
+```{r}
+# Train a random forest model with positive and negative term frequencies
+rf_model <- randomForest(response ~ term_freq_positive + term_freq_negative, data = training, ntree = 5)
+
+# Make predictions on the testing set
+predictions <- predict(rf_model, newdata = testing, type = "response")
+
+# Convert predicted probabilities to numerical values (0 or 1)
+binary_rf <- as.numeric(predictions > 0.5)
+
+# Create a confusion table to evaluate model performance
+conf_table <- table("Reference" = testing$response, "Predicted" = binary_rf)
+print(conf_table)
+
+# Calculate accuracy from the confusion table
+accuracy <- sum(diag(conf_table)) / sum(conf_table)
+print(accuracy)
+# 0.685
+```
+
+### Conducting Random Forest With Cross Validation
+
+```{r}
+# Specify the formula for the Random Forest model
+formula <- response ~ term_freq_positive + term_freq_negative
+
+# Combine features and response into a data frame
+data <- data.frame(
+  term_freq_positive = c(training$term_freq_positive, testing$term_freq_positive),
+  term_freq_negative = c(training$term_freq_negative, testing$term_freq_negative),
+  response = factor(c(training$response, testing$response))
+)
+
+# Set the number of folds
+K <- 10
+
+# Create an empty vector to store accuracy values
+accuracy_values <- numeric(K)
+
+# Perform cross-validated Random Forest
+set.seed(1)  # Set seed for reproducibility
+for (i in 1:K) {
+  # Split the data into training and testing sets
+  test_indices <- ((i - 1) * nrow(data) / K + 1):(i * nrow(data) / K)
+  test_data <- data[test_indices, ]
+  train_data <- data[-test_indices, ]
+
+  # Fit the Random Forest model on the training data
+  rf_model <- randomForest(formula, data = train_data, ntree = 100)
+
+  # Make predictions on the test data
+  predictions <- predict(rf_model, newdata = test_data, type = "response")
+
+  # Calculate accuracy and store in the vector
+  accuracy_values[i] <- sum(predictions == test_data$response) / nrow(test_data)
+}
+
+# Print mean cross-validated accuracy
+mean_accuracy <- mean(accuracy_values)
+print(mean_accuracy)
+# 0.70216
+```
+
+```{r}
+library(ggplot2)
+
+# Create a data frame with the predictors
+predictors <- term_freq_df_scaled[, c('term_freq_positive', 'term_freq_negative')]
+
+# Apply PCA
+pca_result <- prcomp(predictors, center = TRUE, scale. = TRUE)
+
+# Eigenvalues and explained variance
+summary(pca_result)
+```
+
+1. Standard Deviation:
+
+PC1: 1.1478
+PC2: 0.8262
+The standard deviation represents the spread or variability of the data along each principal component. In this case, PC1 has a higher standard deviation (1.1478) compared to PC2 (0.8262), indicating that PC1 captures more variability in the data.
+
+2. Proportion of Variance:
+
+PC1: 0.6587
+PC2: 0.3413
+The proportion of variance indicates the proportion of the total variance in the dataset that is explained by each principal component. PC1 explains 65.87% of the total variance, while PC2 explains 34.13%. Together, they account for 100% of the variance in your data.
+
+3. Cumulative Proportion:
+
+PC1: 0.6587
+PC2: 1.0000
+The cumulative proportion represents the cumulative amount of variance explained as you move from the first principal component to subsequent ones. In this case, after including PC1 (65.87%), adding PC2 brings the cumulative proportion to 100%. This means that using both PC1 and PC2 accounts for all the variance in your data.
+
+Interpretation:
+
+- PC1 captures the majority of the variability in your data (65.87%). It is the dominant source of information.
+- PC2 captures the remaining variability (34.13%) that is not explained by PC1.
+- The cumulative proportion of 100% means that using both PC1 and PC2 provides a complete description of the variability in your data.
+
+In this case, using both PC1 and PC2 covers the entire variability in the data.
